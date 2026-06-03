@@ -4821,25 +4821,42 @@ async function callClaude(messages, maxTokens=2000){
 // ─── 多 LLM 统一调用接口 ──────────────────────────────────────
 
 // 调用顺序：Ollama本地优先（若开启）→ 其他云API → 本地引擎兜底
+// 成功返回字符串，失败返回 null 并将错误详情写入 RPT.lastError
 async function callLLM(messages, maxTokens=2000){
+  // 归一化：支持字符串 prompt 和 messages 数组两种调用方式
+  if (typeof messages === 'string') messages = [{ role: 'user', content: messages }];
   const order = ['ollama','claude','openai','deepseek','kimi','gemini','qwen','zhipu'];
+  const errors = [];
+  const tried = [];
   for(const name of order){
     const p = STATE.llmProviders[name];
     if(!p || !p.enabled) continue;
     if(name !== 'ollama' && !p.apiKey) continue; // ollama不需要key
+    tried.push(name);
     try{
       let result;
       if(name==='claude')       result = await callClaudeProvider(messages, p, maxTokens);
       else if(name==='gemini')  result = await callGeminiProvider(messages, p, maxTokens);
       else if(name==='ollama')  result = await callOllamaProvider(messages, p, maxTokens);
       else result = await callOpenAICompatibleProvider(messages, p, maxTokens);
-      if(result) return result;
-    } catch(e){ console.warn('[LLM]',name,'failed:',e.message); }
+      if(result) { RPT.lastError = null; return result; }
+    } catch(e){
+      const msg = name + ': ' + (e.message || '未知错误');
+      console.warn('[LLM]', msg);
+      errors.push(msg);
+    }
   }
   // 兜底：旧版单独 apiKey
   if(STATE.apiKey){
-    try{ return await callClaude(messages, maxTokens); } catch(e){}
+    tried.push('claude-legacy');
+    try{ const r = await callClaude(messages, maxTokens); if(r) { RPT.lastError = null; return r; } } catch(e){
+      errors.push('claude-legacy: ' + (e.message || '未知错误'));
+    }
   }
+  // 所有提供者失败：记录错误详情
+  if(errors.length) RPT.lastError = { error: errors.join('; '), tried };
+  else if(!tried.length) RPT.lastError = { error: '未配置任何大模型。请在「设置」或上方 API Key 栏配置。', tried: [] };
+  else RPT.lastError = { error: '所有配置的模型均返回空结果', tried };
   return null;
 }
 
@@ -4887,8 +4904,9 @@ async function callOpenAICompatibleProvider(messages, p, maxTokens=2000){
   // 不同厂商 base URL 拼接规则
   let url = p.baseUrl;
   if(url.endsWith('/')) url=url.slice(0,-1);
-  // DashScope Qwen 需要额外路径
-  if(p.baseUrl.includes('dashscope')) url += '/v1/chat/completions';
+  // 智能拼接：如果 baseUrl 已包含 /v1 /v4 等版本路径，直接加 /chat/completions
+  // 智谱 open.bigmodel.cn/api/paas/v4、OpenAI api.openai.com/v1 等
+  if(/\/v\d+$/.test(url) || url.includes('dashscope')) url += '/chat/completions';
   else url += '/v1/chat/completions';
 
   const r = await fetch(url,{
@@ -12630,7 +12648,7 @@ function sr3CalcBuyScore(){
   // 基本面向好（40分）
   const boomScore = boom>=70?40:boom>=55?28:boom>=40?16:0;
   score+=boomScore;
-  details.push({label:'景气度',val:boom,score:boomScore,max:40,note:boom>=70?'强烈看好':'boom<40?'偏弱,降低建仓':'一般'});
+  details.push({label:'景气度',val:boom,score:boomScore,max:40,note:boom>=70?'强烈看好':(boom<40?'偏弱,降低建仓':'一般')});
   const compScore = comp==='A'?25:comp==='B'?20:comp==='C'?10:0;
   score+=compScore;
   if(comp==='D') warnings.push('⚠️ 竞争格局分散，价格战风险高');
@@ -13150,7 +13168,8 @@ async function rptGenerate() {
     }
   }
 
-  if (btn) { btn.disabled=false; btn.textContent='生成研报'; }
+  // 保持按钮禁用，直到生成完成或取消
+  if (btn) { btn.disabled=true; btn.textContent='生成中...'; }
 
   // 4. 识别市场
   const mkt = rptDetectMarket(code);
@@ -13160,6 +13179,7 @@ async function rptGenerate() {
   // 5. 启动生成
   RPT.currentCode = code;
   RPT.cancelled = false;
+  window._rptFirstErrorShown = false;
 
   const MODS_QUICK = ['一、商业价值评估','二、价格趋势与交易策略','三、风险量化与对冲','十、宏观经济环境研判'];
   const MODS_FULL  = ['一、商业价值评估','二、价格趋势与交易策略','三、风险量化与对冲方案',
@@ -13210,6 +13230,8 @@ async function rptGenerate() {
     if (ba) ba.style.display = 'flex';
     rptNavShow(mods);
     rptHistSave(code, mkt, sdata);
+    const btn = document.getElementById('rpt-gen-btn');
+    if (btn) { btn.disabled = false; btn.textContent = '生成研报'; }
     toast('✅ 研报生成完成');
   }, 600);
 }
@@ -13218,6 +13240,8 @@ function rptCancel() {
   RPT.cancelled = true;
   const pa = document.getElementById('rpt-progress-area');
   if (pa) pa.style.display = 'none';
+  const btn = document.getElementById('rpt-gen-btn');
+  if (btn) { btn.disabled = false; btn.textContent = '生成研报'; }
   toast('已取消');
 }
 
@@ -13278,7 +13302,18 @@ ${mktRules[mkt.market] || ''}
 
   try {
     const result = await callLLM([{ role: 'user', content: prompt }], 1500);
-    return result || `<p style="color:var(--muted)">「${modName}」生成失败，请检查LLM配置。</p>`;
+    if (result) return result;
+    // callLLM 返回 null，从 RPT.lastError 读取失败原因
+    const errInfo = RPT.lastError?.error || '未知错误';
+    const triedList = (RPT.lastError?.tried?.length) ? '（已尝试：' + RPT.lastError.tried.join(' → ') + '）' : '';
+    if (!window._rptFirstErrorShown) {
+      window._rptFirstErrorShown = true;
+      toast('⚠ LLM调用失败：' + errInfo + ' ' + triedList, 6000);
+    }
+    return `<p style="color:var(--up);font-weight:600">❌「${modName}」生成失败</p>
+<p style="color:var(--muted);font-size:12px">原因：${errInfo}</p>
+<p style="color:var(--muted);font-size:12px">${triedList}</p>
+<p style="color:var(--muted);font-size:11px">💡 请在「设置 → 多大模型配置」或研报页上方检查API Key和网络连通性。</p>`;
   } catch(e) {
     return `<p style="color:var(--muted)">「${modName}」调用出错：${e.message}</p>`;
   }
